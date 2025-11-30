@@ -10,80 +10,75 @@ using Serilog;
 
 namespace FileSite.Services;
 
-public class FileCleanup : IHostedService, IDisposable
-{   //default implementation of logger is still in use
-    private ILogger<FileCleanup> _logger;
-    private Timer? _timer = null;
+public class FileCleanup : BackgroundService
+{
+    private readonly ILogger<FileCleanup> _logger;
+    private readonly IServiceScopeFactory _scopeFactory;
 
-
-    public FileCleanup(ILogger<FileCleanup> logger)
+    // Inject IServiceScopeFactory to create DbContexts on the fly
+    public FileCleanup(ILogger<FileCleanup> logger, IServiceScopeFactory scopeFactory)
     {
         _logger = logger;
+        _scopeFactory = scopeFactory;
     }
 
-    public async void CheckFileLifeTime(object? state)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var options = new DbContextOptionsBuilder().UseNpgsql(JsonNode.Parse(File.ReadAllText("appsettings.json"))["ConnectionStrings"]["DefaultConnection"].ToString());
-        ApplicationDbContext _context = new(options.Options);
+        _logger.LogInformation("File Cleanup is running.");
+        using PeriodicTimer timer = new PeriodicTimer(TimeSpan.FromHours(6));
 
-
-        List<FileData> toBeDeleted = await _context.FileDatas.ToListAsync();
-        foreach (FileData fileData in toBeDeleted)
+        while (await timer.WaitForNextTickAsync(stoppingToken))
         {
-            switch (fileData.LifeTime)
+            try
             {
-                case FileFileTimeEnum.oneDay:
-                    if (fileData.CreationDate + 86400 < DateTimeOffset.UtcNow.ToUnixTimeSeconds())
-                    {
-                        File.Delete(fileData.Location);
-                        Log.Information("Deleting {@fileData.Location}. Lifetime Ended",fileData.Location);
-                        _context.Remove(fileData);
-                    }
-                    break;
-                case FileFileTimeEnum.oneWeek:
-                    if (fileData.CreationDate + 604800 < DateTimeOffset.UtcNow.ToUnixTimeSeconds())
-                    {
-                        File.Delete(fileData.Location);
-                        Log.Information("Deleting {@fileData.Location}. Lifetime Ended",fileData.Location);
-                        _context.Remove(fileData);
-                    }
-                    break;
-                case FileFileTimeEnum.oneMonth:
-                    if (fileData.CreationDate + 2629743 < DateTimeOffset.UtcNow.ToUnixTimeSeconds())
-                    {
-                        File.Delete(fileData.Location);
-                        Log.Information("Deleting {@fileData.Location}. Lifetime Ended",fileData.Location);
-                        _context.Remove(fileData);
-                    }
-                    break;
-                case FileFileTimeEnum.oneYear:
-                    if (fileData.CreationDate + 31556926 < DateTimeOffset.UtcNow.ToUnixTimeSeconds())
-                    {
-                        File.Delete(fileData.Location);
-                        Log.Information("Deleting {@fileData.Location}. Lifetime Ended",fileData.Location);
-                        _context.Remove(fileData);
-                    }
-                    break;
-                case FileFileTimeEnum.Permanent:
-                    break;
+                await CleanUpFilesAsync();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error occurred during file cleanup.");
             }
         }
-        _context.SaveChanges();
+
+        _logger.LogInformation("File Cleanup has stopped.");
     }
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    public async Task CleanUpFilesAsync()
     {
-        _logger.LogInformation(eventId:100,"File Cleanup is running.");
-        _timer = new Timer(CheckFileLifeTime, null, TimeSpan.Zero, TimeSpan.FromHours(6.0));
+        // Create a scope to get the DbContext
+        using (var scope = _scopeFactory.CreateScope())
+        {
+            var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
 
-        return Task.CompletedTask;
-    }
+            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            // Define thresholds
+            long oneDayAgo = now - 86400;
+            long oneWeekAgo = now - 604800;
+            long oneMonthAgo = now - 2629743;
+            long oneYearAgo = now - 31556926;
 
-    public Task StopAsync(CancellationToken cancellationToken)
-    {
-        _logger.LogInformation(eventId:-100,"File Cleanup has stopped.");
-        _timer?.Change(Timeout.Infinite, 0);
-        return Task.CompletedTask;
+            // Filter strictly in the database
+            var toBeDeleted = await context.FileDatas
+                .Where(f =>
+                    (f.LifeTime == FileFileTimeEnum.oneDay && f.CreationDate < oneDayAgo) ||
+                    (f.LifeTime == FileFileTimeEnum.oneWeek && f.CreationDate < oneWeekAgo) ||
+                    (f.LifeTime == FileFileTimeEnum.oneMonth && f.CreationDate < oneMonthAgo) ||
+                    (f.LifeTime == FileFileTimeEnum.oneYear && f.CreationDate < oneYearAgo)
+                )
+                .ToListAsync();
+
+            if (!toBeDeleted.Any()) return;
+
+            foreach (var fileData in toBeDeleted)
+            {
+                if (File.Exists(fileData.Location))
+                {
+                    File.Delete(fileData.Location);
+                    _logger.LogInformation("Deleted file: {Location}", fileData.Location);
+                }
+                context.Remove(fileData);
+            }
+
+            await context.SaveChangesAsync();
+        }
     }
-    public void Dispose() { _timer?.Dispose(); }
 }

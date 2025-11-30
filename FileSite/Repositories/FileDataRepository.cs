@@ -24,7 +24,11 @@ namespace FileSite.Repositories
 
         public async Task<string> Add(FileDataVM fileView, string Path)
         { 
-
+            string ownerId = null;
+            var userPrincipal = _contextAccessor.HttpContext?.User;
+            if (userPrincipal != null)
+                ownerId = _userManager.GetUserId(userPrincipal);
+            
             string hash = BitConverter.ToString(MD5.Create().ComputeHash(fileView.File.OpenReadStream())).Replace("-", "").ToLower();
             if (await ValidatDistinct(hash)) return null;
             #region Streaming
@@ -40,7 +44,7 @@ namespace FileSite.Repositories
                     Location = $"{Path}/{fileView.File.FileName}",
                     hash = hash,
                     LifeTime = fileView.LifeTime,
-                    OwnerId = _userManager.GetUserId(_contextAccessor.HttpContext.User),
+                    OwnerId = ownerId,
                     CreationDate=DateTimeOffset.Now.ToUnixTimeSeconds(),
                     Size= streaam.Length
                 };
