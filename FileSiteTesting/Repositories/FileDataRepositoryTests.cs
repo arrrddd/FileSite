@@ -9,6 +9,7 @@ using FileSite.Repositories;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
+using StackExchange.Redis;
 
 namespace FileSiteTesting.Repositories;
 
@@ -17,6 +18,8 @@ public class FileDataRepositoryTests : IDisposable
 {
     private readonly IHttpContextAccessor _httpContextAccessor;
     private readonly UserManager<AppUser> _userManager;
+    private readonly IConnectionMultiplexer _redis;
+    private readonly IDatabase _redisDb;
     private readonly string _tempTestPath;
 
     public FileDataRepositoryTests()
@@ -27,7 +30,11 @@ public class FileDataRepositoryTests : IDisposable
         _httpContextAccessor = A.Fake<IHttpContextAccessor>();
         var store = A.Fake<IUserStore<AppUser>>();
         _userManager = A.Fake<UserManager<AppUser>>(o => 
-            o.WithArgumentsForConstructor(new object[] { store, null, null, null, null, null, null, null, null }));
+            o.WithArgumentsForConstructor(new object[] { store, null!, null!, null!, null!, null!, null!, null!, null! }));
+        
+        _redis = A.Fake<IConnectionMultiplexer>();
+        _redisDb = A.Fake<IDatabase>();
+        A.CallTo(() => _redis.GetDatabase(A<int>._, A<object>._)).Returns(_redisDb);
     }
 
     private ApplicationDbContext GetInMemoryDatabase()
@@ -52,13 +59,13 @@ public class FileDataRepositoryTests : IDisposable
     [Theory]
     [InlineData(true, "user-999", "MyFile.txt")] // Case 1: Logged In
     [InlineData(false, null, "Anon.txt")]        // Case 2: Anonymous
-    public async Task Add_ValidRequest_ShouldSaveFile(bool isAuthenticated, string expectedOwnerId, string fileName)
+    public async Task Add_ValidRequest_ShouldSaveFile(bool isAuthenticated, string? expectedOwnerId, string fileName)
     {
         // --- ARRANGE ---
         using var context = GetInMemoryDatabase();
         var fakeContext = A.Fake<HttpContext>();
 
-        if (isAuthenticated)
+        if (isAuthenticated && expectedOwnerId != null)
         {
             // Setup User Claims
             var fakePrincipal = new ClaimsPrincipal(new ClaimsIdentity(new[] { new Claim(ClaimTypes.NameIdentifier, expectedOwnerId) }));
@@ -73,15 +80,15 @@ public class FileDataRepositoryTests : IDisposable
 
         A.CallTo(() => _httpContextAccessor.HttpContext).Returns(fakeContext);
 
-        var repo = new FileDataRepository(context, _httpContextAccessor, _userManager);
-        var fileVM = new FileDataVM 
+        var repo = new FileDataRepository(context, _httpContextAccessor, _userManager, _redis);
+        var fileVm = new FileDataVM 
         { 
             File = CreateFakeFormFile("Test Content", fileName), 
             LifeTime = FileFileTimeEnum.Permanent 
         };
 
         // --- ACT ---
-        var resultHash = await repo.Add(fileVM, _tempTestPath);
+        var resultHash = await repo.Add(fileVm, _tempTestPath);
 
         // --- ASSERT ---
         Assert.NotNull(resultHash);
@@ -98,7 +105,7 @@ public class FileDataRepositoryTests : IDisposable
     {
         // Arrange
         using var context = GetInMemoryDatabase();
-        var repo = new FileDataRepository(context, _httpContextAccessor, _userManager);
+        var repo = new FileDataRepository(context, _httpContextAccessor, _userManager, _redis);
         
         var content = "Duplicate Content";
         
@@ -114,13 +121,40 @@ public class FileDataRepositoryTests : IDisposable
         context.FileDatas.Add(new FileData { hash = hash, Name = "existing.txt", LifeTime = FileFileTimeEnum.Permanent,Location = _tempTestPath });
         await context.SaveChangesAsync();
 
-        var fileVM = new FileDataVM { File = CreateFakeFormFile(content, "new.txt"), LifeTime = FileFileTimeEnum.Permanent };
+        var fileVm = new FileDataVM { File = CreateFakeFormFile(content, "new.txt"), LifeTime = FileFileTimeEnum.Permanent };
 
         // Act
-        var result = await repo.Add(fileVM, _tempTestPath);
+        var result = await repo.Add(fileVm, _tempTestPath);
 
         // Assert
         Assert.Null(result);
+    }
+
+    [Fact]
+    public async Task Add_FileWithExpiration_ShouldAddToRedis()
+    {
+        // Arrange
+        using var context = GetInMemoryDatabase();
+        var fakeContext = A.Fake<HttpContext>();
+        A.CallTo(() => fakeContext.User).Returns(null);
+        A.CallTo(() => _httpContextAccessor.HttpContext).Returns(fakeContext);
+
+        var repo = new FileDataRepository(context, _httpContextAccessor, _userManager, _redis);
+        var fileVm = new FileDataVM 
+        { 
+            File = CreateFakeFormFile("Expiring Content", "expiring.txt"), 
+            LifeTime = FileFileTimeEnum.oneDay 
+        };
+
+        // Act
+        var resultHash = await repo.Add(fileVm, _tempTestPath);
+
+        // Assert
+        Assert.NotNull(resultHash);
+        
+        // Verify Redis was called
+        A.CallTo(() => _redisDb.SortedSetAddAsync("file_expirations", A<RedisValue>._, A<double>._, A<When>._, A<CommandFlags>._))
+            .MustHaveHappenedOnceExactly();
     }
 
     public void Dispose()

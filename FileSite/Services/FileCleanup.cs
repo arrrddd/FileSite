@@ -1,12 +1,5 @@
 ﻿using FileSite.Data;
-using FileSite.Models;
-using Microsoft.EntityFrameworkCore;
-using Microsoft.EntityFrameworkCore.Infrastructure;
-using System.Diagnostics;
-using FileSite.Data.Enums;
-using Microsoft.Extensions.Configuration;
-using System.Text.Json.Nodes;
-using Serilog;
+using StackExchange.Redis;
 
 namespace FileSite.Services;
 
@@ -14,12 +7,13 @@ public class FileCleanup : BackgroundService
 {
     private readonly ILogger<FileCleanup> _logger;
     private readonly IServiceScopeFactory _scopeFactory;
+    private readonly IConnectionMultiplexer _redis;
 
-    // Inject IServiceScopeFactory to create DbContexts on the fly
-    public FileCleanup(ILogger<FileCleanup> logger, IServiceScopeFactory scopeFactory)
+    public FileCleanup(ILogger<FileCleanup> logger, IServiceScopeFactory scopeFactory, IConnectionMultiplexer redis)
     {
         _logger = logger;
         _scopeFactory = scopeFactory;
+        _redis = redis;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -44,41 +38,57 @@ public class FileCleanup : BackgroundService
 
     public async Task CleanUpFilesAsync()
     {
-        // Create a scope to get the DbContext
+        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var db = _redis.GetDatabase();
+
+        // Get all files with score (expiration time) <= now
+        var expiredFileIds = await db.SortedSetRangeByScoreAsync("file_expirations", double.NegativeInfinity, now);
+
+        if (expiredFileIds.Length == 0)
+        {
+            return;
+        }
+
         using (var scope = _scopeFactory.CreateScope())
         {
             var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            var idsToRemoveFromRedis = new List<RedisValue>();
 
-            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            // Define thresholds
-            long oneDayAgo = now - 86400;
-            long oneWeekAgo = now - 604800;
-            long oneMonthAgo = now - 2629743;
-            long oneYearAgo = now - 31556926;
-
-            // Filter strictly in the database
-            var toBeDeleted = await context.FileDatas
-                .Where(f =>
-                    (f.LifeTime == FileFileTimeEnum.oneDay && f.CreationDate < oneDayAgo) ||
-                    (f.LifeTime == FileFileTimeEnum.oneWeek && f.CreationDate < oneWeekAgo) ||
-                    (f.LifeTime == FileFileTimeEnum.oneMonth && f.CreationDate < oneMonthAgo) ||
-                    (f.LifeTime == FileFileTimeEnum.oneYear && f.CreationDate < oneYearAgo)
-                )
-                .ToListAsync();
-
-            if (!toBeDeleted.Any()) return;
-
-            foreach (var fileData in toBeDeleted)
+            foreach (var redisValue in expiredFileIds)
             {
-                if (File.Exists(fileData.Location))
+                if (int.TryParse(redisValue.ToString(), out int fileId))
                 {
-                    File.Delete(fileData.Location);
-                    _logger.LogInformation("Deleted file: {Location}", fileData.Location);
+                    var fileData = await context.FileDatas.FindAsync(fileId);
+                    if (fileData != null)
+                    {
+                        if (File.Exists(fileData.Location))
+                        {
+                            try
+                            {
+                                File.Delete(fileData.Location);
+                                _logger.LogInformation("Deleted file: {Location}", fileData.Location);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Failed to delete file: {Location}", fileData.Location);
+                            }
+                        }
+                        context.Remove(fileData);
+                        idsToRemoveFromRedis.Add(redisValue);
+                    }
+                    else
+                    {
+                        // File not found in DB, remove from Redis to keep it clean
+                        idsToRemoveFromRedis.Add(redisValue);
+                    }
                 }
-                context.Remove(fileData);
             }
 
-            await context.SaveChangesAsync();
+            if (idsToRemoveFromRedis.Count > 0)
+            {
+                await context.SaveChangesAsync();
+                await db.SortedSetRemoveAsync("file_expirations", idsToRemoveFromRedis.ToArray());
+            }
         }
     }
 }
