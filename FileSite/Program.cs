@@ -19,6 +19,7 @@ Log.Logger = new LoggerConfiguration().WriteTo.Console().CreateLogger();
 builder.Services.AddControllersWithViews();
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<IFileDataRepository, FileDataRepository>();
+builder.Services.AddScoped<IDiskStorageRepository, DiskStorageRepository>();
 
 builder.Services.AddDbContext<ApplicationDbContext>(options =>
 {
