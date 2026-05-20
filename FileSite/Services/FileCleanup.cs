@@ -1,4 +1,5 @@
 ﻿using FileSite.Data;
+using FileSite.Data.Interfaces;
 using StackExchange.Redis;
 
 namespace FileSite.Services;
@@ -41,7 +42,6 @@ public class FileCleanup : BackgroundService
         long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var db = _redis.GetDatabase();
 
-        // Get all files with score (expiration time) <= now
         var expiredFileIds = await db.SortedSetRangeByScoreAsync("file_expirations", double.NegativeInfinity, now);
 
         if (expiredFileIds.Length == 0)
@@ -52,6 +52,7 @@ public class FileCleanup : BackgroundService
         using (var scope = _scopeFactory.CreateScope())
         {
             var context = scope.ServiceProvider.GetRequiredService<ApplicationDbContext>();
+            var diskStorage = scope.ServiceProvider.GetRequiredService<IDiskStorageRepository>();
             var idsToRemoveFromRedis = new List<RedisValue>();
 
             foreach (var redisValue in expiredFileIds)
@@ -61,24 +62,21 @@ public class FileCleanup : BackgroundService
                     var fileData = await context.FileDatas.FindAsync(fileId);
                     if (fileData != null)
                     {
-                        if (File.Exists(fileData.Location))
+                        try
                         {
-                            try
-                            {
-                                File.Delete(fileData.Location);
-                                _logger.LogInformation("Deleted file: {Location}", fileData.Location);
-                            }
-                            catch (Exception ex)
-                            {
-                                _logger.LogError(ex, "Failed to delete file: {Location}", fileData.Location);
-                            }
+                            diskStorage.DeleteFile(fileData.Location);
+                            _logger.LogInformation("Deleted file: {Location}", fileData.Location);
                         }
+                        catch (Exception ex)
+                        {
+                            _logger.LogError(ex, "Failed to delete file: {Location}", fileData.Location);
+                        }
+                        
                         context.Remove(fileData);
                         idsToRemoveFromRedis.Add(redisValue);
                     }
                     else
                     {
-                        // File not found in DB, remove from Redis to keep it clean
                         idsToRemoveFromRedis.Add(redisValue);
                     }
                 }
