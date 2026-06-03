@@ -1,21 +1,19 @@
 ﻿FROM mcr.microsoft.com/dotnet/aspnet:9.0 AS base
-USER $APP_UID
 WORKDIR /app
-EXPOSE 8080
-EXPOSE 8081
+EXPOSE 80
+
+RUN mkdir -p /app/uploads && chmod -R 777 /app/uploads
 
 FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
-ARG BUILD_CONFIGURATION=Release
 WORKDIR /src
 COPY ["FileSite/FileSite.csproj", "FileSite/"]
 RUN dotnet restore "FileSite/FileSite.csproj"
 COPY . .
 WORKDIR "/src/FileSite"
-RUN dotnet build "FileSite.csproj" -c $BUILD_CONFIGURATION -o /app/build
+RUN dotnet build "FileSite.csproj" -c Release -o /app/build
 
 FROM build AS publish
-ARG BUILD_CONFIGURATION=Release
-RUN dotnet publish "FileSite.csproj" -c $BUILD_CONFIGURATION -o /app/publish /p:UseAppHost=false
+RUN dotnet publish "FileSite.csproj" -c Release -o /app/publish
 
 FROM base AS final
 WORKDIR /app
